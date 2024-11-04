@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using System.Net.Http;
 using System.Text;
 using Newtonsoft.Json;
+using Microsoft.Extensions.Logging;
 
 
 namespace ST10298613_POE.Controllers
@@ -16,13 +17,21 @@ namespace ST10298613_POE.Controllers
         private readonly TableService _tableService;
         private readonly QueueService _queueService;
         private readonly FileService _fileService;
+        private readonly ILogger<HomeController> _logger;
+        private readonly IConfiguration _configuration;
+       
 
-        public HomeController(BlobService blobService, TableService tableService, QueueService queueService, FileService fileService)
+
+        public HomeController(BlobService blobService, TableService tableService, QueueService queueService, FileService fileService, ILogger<HomeController> logger, IConfiguration configuration)
         {
             _blobService = blobService;
             _tableService = tableService;
             _queueService = queueService;
             _fileService = fileService;
+            _logger = logger;
+            _configuration = configuration;
+            
+            
         }
 
         public IActionResult Index()
@@ -35,13 +44,44 @@ namespace ST10298613_POE.Controllers
         {
             if (file != null)
             {
-                using var stream = file.OpenReadStream();
-                await _blobService.UploadBlobAsync("product-images", file.FileName, stream);
+                try
+                {
+                    using var stream = file.OpenReadStream();
+                    await _blobService.UploadBlobAsync("product-images", file.FileName, stream);
 
-                // Send data to Azure Function
-                var data = new { containerName = "product-images", blobName = file.FileName };
-                await PostDataToFunction("https://st10298613functionapp.azurewebsites.net/api/UploadBlob?code=Icc5XsxFVaFVbiVqkpKTSjhyJCstHASGjwkv7d7ywod0AzFu3RBG7g%3D%3D", data);
+                    var baseUrl = _configuration["AzureFunctions:UploadBlob"];
+                    var requestUri = $"{baseUrl}&blobName={file.FileName}";
+                    using var httpClient = new HttpClient();
+                    var content = new StreamContent(stream);
+                    content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(file.ContentType);
+
+                    var response = await httpClient.PostAsync(requestUri, content);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        using (var memoryStream = new MemoryStream())
+                        {
+                            await file.CopyToAsync(memoryStream);
+                            var imageData = memoryStream.ToArray();
+
+                            // Insert image data into SQL BlobTable
+                            await _blobService.InsertBlobAsync(imageData);
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogError($"Error submitting image data: {response.ReasonPhrase}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"Exception occurred while submitting image: {ex.Message}");
+                }
             }
+            else
+            {
+                _logger.LogError("No image file provided.");
+            }
+
             return RedirectToAction("Index");
         }
 
@@ -51,17 +91,30 @@ namespace ST10298613_POE.Controllers
         {
             if (ModelState.IsValid)
             {
-                await _tableService.AddEntityAsync(profile);
-
-                // Send data to Azure Function
-                var data = new
+                try
                 {
-                    tableName = "CustomerProfiles",
-                    partitionKey = profile.PartitionKey,
-                    rowKey = profile.RowKey,
-                    data = JsonConvert.SerializeObject(profile)
-                };
-                await PostDataToFunction("https://st10298613functionapp.azurewebsites.net/api/StoreTableInfo?code=EHP0iPW2tCn8gfkovdrwFg2RJTULXcf7sxSihc9geoWUAzFuR0OGAA%3D%3D", data);
+                    await _tableService.AddEntityAsync(profile);
+
+                    var baseUrl = _configuration["AzureFunctions:StoreTableInfo"];
+                    var requestUri = $"{baseUrl}&tableName=CustomerProfiles&partitionKey={profile.PartitionKey}&rowKey={profile.RowKey}&firstName={profile.FirstName}&lastName={profile.LastName}&email={profile.Email}&phoneNumber={profile.PhoneNumber}";
+
+                    using var httpClient = new HttpClient();
+                    var response = await httpClient.PostAsync(requestUri, null);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        await _tableService.InsertCustomerAsync(profile);
+                        return RedirectToAction("Index");
+                    }
+                    else
+                    {
+                        _logger.LogError($"Error submitting client info: {response.ReasonPhrase}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"Exception occurred while submitting client info: {ex.Message}");
+                }
             }
             return RedirectToAction("Index");
         }
